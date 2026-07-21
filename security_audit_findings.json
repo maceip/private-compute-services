@@ -1,0 +1,217 @@
+[
+  {
+    "id": "VULN-001",
+    "severity": "HIGH",
+    "location": "src/com/google/android/as/oss/feedback/gateway/FeedbackHttpClientImpl.kt:293",
+    "title": "PSI/Spoon feedback path uses unescaped quote() enabling JSON injection in HTTP upload body",
+    "description": "The PSI/Spoon code path in FeedbackHttpClientImpl.convertToRequestString() uses a quote() function (line 293) that performs NO escaping of special characters: `private fun quote(content: Any): String = \"\\\"$content\\\"\"`. This is in contrast to the Quartz and MessageArmour paths which DO escape double quotes via `.replace(\"\\\"\" , \"\\\\\\\"\")`. Any protobuf string field containing a double quote character (e.g. additionalComment, groundTruthList entries, triggeringMessages, intentQueries, modelOutputs, memoryEntity entityData/modelVersion, selectedEntityContent) will break out of the JSON string value and inject arbitrary JSON keys/values into the HTTP request body sent to the APEX backend.",
+    "impact": "An authorized caller (ASI/PSI app) sending a LogFeedbackV2Request with crafted string fields (e.g. additionalComment containing `\", \"maliciousKey\": \"maliciousValue`) can inject arbitrary JSON into the HTTP POST body sent to the APEX server. This could corrupt server-side data processing, inject false feedback data attributed to real users, or trigger server-side vulnerabilities if the APEX backend parses injected fields. Combined with the FeedbackHttpClientService being exported (android:exported=true), an attacker who can satisfy the security policy check (or on a test-key build) can control the full request payload.",
+    "attack_path": [
+      "1. Attacker app binds to the exported FeedbackHttpClientService",
+      "2. On non-user builds (test keys accepted per allowTestKeys=true), the onTransact security check passes",
+      "3. Attacker sends a LogFeedbackV2Request protobuf with SpoonCUJ (not Quartz/MessageArmour, which escape properly) and sets additionalComment or user donation fields to contain '\"' characters and injected JSON keys",
+      "4. FeedbackHttpClientImpl.convertToRequestString() is called, which uses the unescaping quote() function",
+      "5. The resulting JSON body is malformed/injected with attacker-controlled keys",
+      "6. The body is sent via HTTP POST to the APEX_SERVICE_URL"
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/feedback/gateway/FeedbackHttpClientImpl.kt:293 - `private fun quote(content: Any): String = \"\\\"$content\\\"\"` (no escaping)",
+      "src/com/google/android/as/oss/feedback/quartz/utils/QuartzDataHelper.kt:549-551 - Quartz path DOES escape: `val escapedContent = content.toString().replace(\"\\\"\" , \"\\\\\\\"\")` (fixed version)",
+      "src/com/google/android/as/oss/feedback/messagearmour/utils/MessageArmourDataHelper.kt:138-140 - MessageArmour path also escapes properly",
+      "src/com/google/android/as/oss/feedback/gateway/FeedbackHttpClientImpl.kt:162-211 - convertToRequestString() uses unescaped quote() for appId, interactionId, donationOption, additionalComment, groundTruthList, triggeringMessages, intentQueries, modelOutputs, memoryEntities, selectedEntityContent",
+      "src/com/google/android/as/oss/feedback/gateway/service/FeedbackHttpClientService.kt:63-91 - uploadFeedback parses arbitrary caller-supplied protobuf bytes and passes them through to uploadFeedback"
+    ],
+    "remediation": "Replace the PSI/Spoon `quote()` function at FeedbackHttpClientImpl.kt:293 with the same escaping implementation used by QuartzDataHelper and MessageArmourDataHelper: `private fun quote(content: Any): String { val escapedContent = content.toString().replace(\"\\\"\", \"\\\\\\\"\"); return \"\\\"$escapedContent\\\"\" }`. Better yet, use a proper JSON serialization library (e.g., Gson, Moshi, or kotlinx.serialization) instead of manual string concatenation."
+  },
+  {
+    "id": "VULN-002",
+    "severity": "HIGH",
+    "location": "src/com/google/android/as/oss/feedback/gateway/service/FeedbackHttpClientService.kt:102",
+    "title": "FeedbackHttpClientService hardcodes allowTestKeys=true on production builds, weakening caller authorization",
+    "description": "The FeedbackHttpClientService.onTransact() security check at line 102 unconditionally passes `allowTestKeys=true` to SecurityPolicyUtils.isCallerAuthorized(). Unlike the feedback ServiceConnectionModule channels (which conditionally use `!SecurityPolicyUtils.isUserBuild()`) and the DelegatedUI channels (which also check `!SecurityPolicyUtils.isUserBuild()`), this service always accepts test-signed packages. On user-debug or eng builds—and potentially on production builds if the security policy's test-key check is overly permissive—any app signed with a test key can bind to this exported service and invoke uploadFeedback.",
+    "impact": "An app signed with Android platform test keys can bind to the exported FeedbackHttpClientService and trigger arbitrary feedback uploads to Google's APEX backend. This bypasses the intended caller restriction to only ASI (Android System Intelligence). The attacker can upload fabricated feedback data, potentially poisoning feedback analytics.",
+    "attack_path": [
+      "1. Attacker signs their app with a platform test key (available on userdebug/eng builds, sometimes leaked for user builds)",
+      "2. Attacker app binds to the exported FeedbackHttpClientService (no intent filter protection)",
+      "3. The onTransact() call checks isCallerAuthorized with allowTestKeys=true",
+      "4. Test-key signed app passes the security check",
+      "5. Attacker calls uploadFeedback() with arbitrary LogFeedbackV2Request data",
+      "6. The feedback data is uploaded to the APEX backend under PCS's identity and signing certificate"
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/feedback/gateway/service/FeedbackHttpClientService.kt:94-109 - onTransact passes allowTestKeys=true unconditionally",
+      "src/com/google/android/as/oss/feedback/gateway/service/AndroidManifest.xml:28-32 - service is android:exported=true with no permission or intent-filter restriction",
+      "src/com/google/android/as/oss/feedback/serviceclient/serviceconnection/ServiceConnectionModule.kt:66 - Channel uses `!SecurityPolicyUtils.isUserBuild()` for allowTestKeys (correct pattern)",
+      "src/com/google/android/as/oss/delegatedui/service/data/serviceconnection/ServiceConnectionModule.kt:138 - DelegatedUI also uses `!SecurityPolicyUtils.isUserBuild()` (correct pattern)"
+    ],
+    "remediation": "Change line 102 from `/* allowTestKeys= */ true` to `/* allowTestKeys= */ !SecurityPolicyUtils.isUserBuild()` to match the pattern used in other channel modules. This ensures test keys are only accepted on non-production builds."
+  },
+  {
+    "id": "VULN-003",
+    "severity": "HIGH",
+    "location": "src/com/google/android/as/oss/pd/attestation/impl/AttestationClientModule.java:48-61",
+    "title": "Protected Download attestation silently disabled on EVT hardware and when config flag is off, with no fallback enforcement",
+    "description": "The AttestationClientModule.providePdAttestationClient() method at line 48-50 selects between AttestationClientImpl (real attestation) and AttestationClientNoopImpl (no-op that returns AttestationResponse.empty()). The no-op path is chosen when: (a) the device has 'EVT' in its hardware revision system property, OR (b) the build is NOT internal AND the enableProtectedDownloadAttestation config flag is false. The no-op implementation returns an empty attestation response (status=NOT_RUN, empty token), which downstream consumers must explicitly check—but there is no evidence in the PD download flow that NOT_RUN status is treated as a failure. This means downloads proceed without device attestation verification.",
+    "impact": "On EVT hardware revision devices or when the attestation config flag is disabled, protected downloads proceed without any device attestation. An attacker with a rooted/modified EVT device (or on any device where the flag is off) can download protected content without proving device integrity. The 'EVT' check uses a simple string contains match on the system property, which on a rooted device could be spoofed to disable attestation on any hardware.",
+    "attack_path": [
+      "1. On a rooted device, attacker sets ro.boot.hardware.revision to contain 'EVT'",
+      "2. AttestationClientModule.isEligibleForAttestation returns false",
+      "3. AttestationClientNoopImpl is injected as the AttestationClient",
+      "4. All calls to requestMeasurementWithContentBinding return AttestationResponse.empty() with status NOT_RUN",
+      "5. Protected download requests proceed without attestation tokens or with empty tokens",
+      "6. If the server does not strictly reject empty attestation tokens, the download succeeds on a compromised device"
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/pd/attestation/impl/AttestationClientModule.java:48-50 - Conditional selection between real and no-op attestation",
+      "src/com/google/android/as/oss/pd/attestation/impl/AttestationClientModule.java:53-61 - isEligibleForAttestation checks EVT and config flag",
+      "src/com/google/android/as/oss/pd/attestation/impl/AttestationClientNoopImpl.java:26-33 - Returns AttestationResponse.empty() (status=NOT_RUN)",
+      "src/com/google/android/as/oss/pd/attestation/AttestationResponse.java:38-40 - empty() creates response with EMPTY token and NOT_RUN status"
+    ],
+    "remediation": "Ensure downstream Protected Download code explicitly rejects attestation responses with status NOT_RUN or FAILED before proceeding with downloads. Consider logging a security warning when the no-op attestation client is used on production builds. The EVT system property check should use a more robust mechanism than a simple string contains match."
+  },
+  {
+    "id": "VULN-004",
+    "severity": "HIGH",
+    "location": "src/com/google/android/as/oss/fl/fcp/service/AstreaExampleStoreService.java:143-149",
+    "title": "Local compute filecopy queries bypass all policy, consent, and network usage validation",
+    "description": "In PcsExampleStoreService.startQuery(), when hasOnlyLocalCompute(selectorContext) returns true AND the collection starts with '/filecopy', the code dispatches directly to fileCopyStartQuery without any policy validation, consent checking, feature name verification, or network usage logging. The method extractInstalledPolicyOptional is called earlier but its result (the installedPolicy) is obtained and never checked for the filecopy path. The hasOnlyLocalCompute check only verifies that the SelectorContext has localCompute set and no federated/eligibilityEval, but does not verify the caller's authority to perform local file copy operations.",
+    "impact": "An attacker who controls the Federated Compute framework (or a compromised FC client) can issue startQuery calls with a '/filecopy' collection prefix and localCompute SelectorContext, bypassing all privacy policy enforcement, consent verification, and network usage logging that normally guards data collection operations. This could enable unauthorized file copy operations between PCS and client apps.",
+    "attack_path": [
+      "1. Federated Compute framework calls PcsExampleStoreService.startQuery() with collection='/filecopy/...'",
+      "2. SelectorContext is crafted to have only localCompute (no federated, no eligibilityEval)",
+      "3. hasOnlyLocalCompute() returns true",
+      "4. collection.startsWith('/filecopy') matches",
+      "5. Code jumps directly to fileCopyStartQuery.get().startQuery() at line 146-148",
+      "6. No policy validation (checkFederatedConfigs not called), no consent check (consentPolicyValid not called), no network usage log check (isKnownConnection/shouldRejectRequest not called)"
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/fl/fcp/service/AstreaExampleStoreService.java:143-149 - filecopy path skips all validation",
+      "src/com/google/android/as/oss/fl/fcp/service/AstreaExampleStoreService.java:151-181 - non-local-compute path has extensive validation (checkFederatedConfigs, consentPolicyValid, isKnownConnection, shouldRejectRequest)",
+      "src/com/google/android/as/oss/fl/fcp/service/AstreaExampleStoreService.java:225-229 - hasOnlyLocalCompute only checks SelectorContext fields",
+      "src/com/google/android/as/oss/fl/localcompute/FileCopyStartQuery.java:29-35 - interface has no security/policy parameters"
+    ],
+    "remediation": "Apply policy validation and consent checks to the filecopy local compute path as well. At minimum, verify that the query's policy matches an installed policy and that consent requirements are satisfied before delegating to FileCopyStartQuery. Consider adding a specific allowlist of permitted filecopy collections."
+  },
+  {
+    "id": "VULN-005",
+    "severity": "MEDIUM",
+    "location": "src/com/google/android/as/oss/grpc/impl/GrpcServerEndpointConfiguratorImpl.java:82-89",
+    "title": "gRPC server security policy defaults to allow-all when enableAllowlistedOnly config flag is false",
+    "description": "In GrpcServerEndpointConfiguratorImpl.buildAndStartOnDeviceServer(), when pccSecurityConfig.enableAllowlistedOnly() returns false (line 83), the server uses untrustedPolicy() (line 88) which returns Status.OK for ALL callers regardless of UID. This means any app on the device can connect to and invoke gRPC services exposed by PCS. The policy is captured once at server build time and is never updated if the config changes later.",
+    "impact": "When the allowlist flag is disabled (which may be the default configuration), any app on the device can connect to PCS's gRPC services. These services include sensitive operations like federated training scheduling, data service interactions, and delegated UI data queries. A malicious app could invoke these services to trigger training on attacker-chosen populations, extract data, or manipulate UI state. NOTE: The known vulnerability list mentions 'gRPC server security policy captured once and never updated' and 'Exported gRPC binder service defaults to allow-all security policy' - this finding provides additional detail on the specific flag-controlled behavior pattern where the untrustedPolicy is a deliberate fallback rather than just a default.",
+    "impact_note": "This may overlap with previously known issues. Including for completeness as the specific enableAllowlistedOnly flag-controlled fallback to untrustedPolicy() is a distinct code pattern worth noting.",
+    "attack_path": [
+      "1. PCS starts and builds its gRPC server",
+      "2. If enableAllowlistedOnly() returns false, untrustedPolicy is used",
+      "3. untrustedPolicy.checkAuthorization(uid) always returns Status.OK",
+      "4. Any app on the device can bind to and invoke PCS's gRPC services",
+      "5. Attacker calls sensitive service methods"
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/grpc/impl/GrpcServerEndpointConfiguratorImpl.java:82-89 - Config-based security policy selection",
+      "src/com/google/android/as/oss/grpc/impl/PcsSecurityPolicies.java:43-50 - untrustedPolicy always returns OK"
+    ],
+    "remediation": "Already listed as known. The untrustedPolicy fallback should be removed or replaced with a deny-all default. The enableAllowlistedOnly flag should default to true."
+  },
+  {
+    "id": "VULN-006",
+    "severity": "HIGH",
+    "location": "src/com/google/android/as/oss/grpc/impl/GrpcServerEndpointConfiguratorImpl.java:95-96 and multiple channel modules",
+    "title": "Systematic setAcceptParcelableMetadataValues(true) across all gRPC binder channels enables Parcelable deserialization attacks",
+    "description": "Every gRPC binder channel and server in the codebase is configured with InboundParcelablePolicy.newBuilder().setAcceptParcelableMetadataValues(true).build(). This is found in at least 6 separate module files. When setAcceptParcelableMetadataValues is true, the gRPC binder framework deserializes arbitrary Parcelable objects from the metadata (headers) of incoming gRPC requests/responses. Parcelable deserialization in Android is a well-known attack vector that can lead to type confusion, arbitrary object instantiation, and in some cases code execution via gadget chains. The ParcelableOverRpcUtils infrastructure in the delegatedui package explicitly uses this capability to send/receive Parcelable objects in gRPC metadata. When combined with the untrusted security policy (VULN-005), any app can send crafted Parcelable objects to PCS's gRPC server.",
+    "impact": "An attacker can send maliciously crafted Parcelable objects in gRPC metadata headers. If PCS deserializes these objects (which it does via ParcelableOverRpcUtils and the MetadataExtractionServerInterceptor), this can trigger type confusion vulnerabilities, heap corruption through malformed Parcel data, or exploitation of Parcelable gadget chains present in the Android framework or loaded libraries. The attack surface is amplified by the use of an untrusted security policy on the server side.",
+    "attack_path": [
+      "1. Attacker app connects to PCS gRPC binder service (allowed by untrustedPolicy or as a data provider with parcelable policy set)",
+      "2. Attacker includes crafted Parcelable objects in gRPC metadata headers",
+      "3. InboundParcelablePolicy with acceptParcelableMetadataValues=true causes the framework to deserialize these Parcelable objects",
+      "4. MetadataExtractionServerInterceptor extracts and processes the deserialized metadata",
+      "5. If the deserialized objects trigger a gadget chain or type confusion, arbitrary code execution or information disclosure can occur"
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/grpc/impl/GrpcServerEndpointConfiguratorImpl.java:113-115 - Server: buildInboundParcelablePolicy() returns setAcceptParcelableMetadataValues(true)",
+      "src/com/google/android/as/oss/grpc/impl/OnDeviceChannelModule.java:57-58 - Client channel: setAcceptParcelableMetadataValues(true)",
+      "src/com/google/android/as/oss/feedback/serviceclient/serviceconnection/ServiceConnectionModule.kt:69-71 - Feedback channel: setAcceptParcelableMetadataValues(true)",
+      "src/com/google/android/as/oss/delegatedui/service/data/serviceconnection/ServiceConnectionModule.kt:141-143 - DelegatedUI data channel: setAcceptParcelableMetadataValues(true)",
+      "src/com/google/android/as/oss/logging/uiusage/serviceconnection/internal/InternalServiceConnectionModule.kt:64-66 - UI Usage channel: setAcceptParcelableMetadataValues(true)",
+      "src/com/google/android/as/oss/delegatedui/utils/ParcelableOverRpcUtils.kt:29-34 - Explicit infrastructure for sending Parcelable in metadata"
+    ],
+    "remediation": "Review whether setAcceptParcelableMetadataValues(true) is necessary for each channel. For server-side endpoints exposed to untrusted callers, use InboundParcelablePolicy.DEFAULT (which rejects parcelable metadata) or set setAcceptParcelableMetadataValues(false). The AgenticIntegrationServiceGrpcClientModule at line 74 correctly uses InboundParcelablePolicy.DEFAULT as a positive example. Where parcelable metadata is truly needed (e.g., DelegatedUI), ensure the security policy restricts callers to trusted packages."
+  },
+  {
+    "id": "VULN-007",
+    "severity": "HIGH",
+    "location": "src/com/google/android/as/oss/fl/fcp/service/AstreaExampleStoreService.java:192-211",
+    "title": "FC consent enforcement is disabled by default via enableConsentCheckInPcs flag defaulting to false",
+    "description": "The consentPolicyValid method in PcsExampleStoreService checks if consent enforcement is enabled via policyConfigReader.getConfig().enableConsentCheckInPcs(). Looking at the PolicyConfig class, the builder defaults this to false: `setEnableConsentCheckInPcs(false)`. When disabled, consentPolicyValid() immediately returns true without checking if the user has opted into Usage & Diagnostics data collection. This means training tasks that require user consent per their policy can execute even when the user has not consented.",
+    "impact_note": "This is listed as a known vulnerability ('FL consent enforcement disabled by default'). Documenting the exact code path for completeness.",
+    "impact": "Federated learning training tasks that policy-requires user consent for Usage & Diagnostics can run without the user's consent being verified, violating the data protection guarantees that the policy framework is supposed to enforce.",
+    "attack_path": [
+      "1. PolicyConfig.builder() defaults enableConsentCheckInPcs to false",
+      "2. If the device/server config reader produces a config without explicitly setting this flag, consent checking is disabled",
+      "3. consentPolicyValid() returns true without checking usageReportingState.isOptedIn()",
+      "4. Training tasks with requiredUserConsent=UsageAndDiagnosticsCheckbox policies execute even when user has not opted in"
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/common/consent/config/PolicyConfig.java:26 - Builder defaults enableConsentCheckInPcs to false",
+      "src/com/google/android/as/oss/fl/fcp/service/AstreaExampleStoreService.java:192-194 - Early return true when flag is disabled"
+    ],
+    "remediation": "Already known. Default enableConsentCheckInPcs to true."
+  },
+  {
+    "id": "VULN-008",
+    "severity": "MEDIUM",
+    "location": "src/com/google/android/as/oss/feedback/gateway/FeedbackHttpClientImpl.kt:72-84",
+    "title": "Feedback upload network usage log validation checks mismatched feature names, allowing bypass",
+    "description": "In FeedbackHttpClientImpl.uploadFeedback(), the network usage validation at lines 72-84 checks two different feature names with two different operations: it calls `isKnownConnection(FEEDBACK_REQUEST, FEATURE_NAME_FEEDBACK_PSI)` and `shouldRejectRequest(FEEDBACK_REQUEST, FEATURE_NAME_FEEDBACK_ASI)`. The logic rejects the request if the PSI connection is not known OR the ASI connection should be rejected. However, the actual `usageLogFeatureName` used for logging is determined by the CUJ type (Quartz/MessageArmour -> ASI, otherwise -> PSI). This means: (1) a Quartz request uses feature name 'feedback_apex_asi' but its rejection check uses the PSI feature name for the isKnownConnection test, and (2) a PSI request uses feature name 'feedback_apex_psi' but its rejection check tests the ASI feature name for shouldRejectRequest. This cross-wiring means the validation checks the wrong feature names against the wrong operations.",
+    "impact": "The mismatched feature names in the validation logic mean the network usage log rejection mechanism can be bypassed. If only the PSI feature is registered as known but the ASI feature is not (or vice versa), requests may be incorrectly allowed or rejected regardless of the actual CUJ type. This weakens the network usage monitoring and rejection framework intended to catch unauthorized network requests.",
+    "attack_path": [
+      "1. An authorized caller sends a Quartz CUJ feedback request",
+      "2. The validation checks isKnownConnection for FEATURE_NAME_FEEDBACK_PSI (wrong feature for Quartz)",
+      "3. If PSI is registered but ASI is not, the isKnownConnection check passes",
+      "4. shouldRejectRequest checks FEATURE_NAME_FEEDBACK_ASI, which may also pass depending on configuration",
+      "5. The request proceeds through an incorrect validation path"
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/feedback/gateway/FeedbackHttpClientImpl.kt:57-70 - usageLogFeatureName set based on CUJ type (Quartz->ASI, PSI->PSI, MessageArmour->ASI)",
+      "src/com/google/android/as/oss/feedback/gateway/FeedbackHttpClientImpl.kt:72-84 - Validation always checks PSI for isKnownConnection and ASI for shouldRejectRequest, regardless of actual CUJ type"
+    ],
+    "remediation": "Use the determined `usageLogFeatureName` for both the isKnownConnection and shouldRejectRequest checks, instead of hardcoding FEATURE_NAME_FEEDBACK_PSI and FEATURE_NAME_FEEDBACK_ASI respectively. The checks should be: `!networkUsageLogRepository.isKnownConnection(FEEDBACK_REQUEST, usageLogFeatureName) || networkUsageLogRepository.shouldRejectRequest(FEEDBACK_REQUEST, usageLogFeatureName)`."
+  },
+  {
+    "id": "VULN-009",
+    "severity": "MEDIUM",
+    "location": "src/com/google/android/as/oss/networkusage/db/impl/NetworkUsageLogModule.java:53-59",
+    "title": "NetworkUsageLog Room database is unencrypted and stores sensitive network metadata",
+    "description": "The NetworkUsageLog Room database is created with Room.databaseBuilder without any encryption. It stores network usage entities containing connection details (URLs, connection types, feature names), download/upload sizes, policy protos, FC run IDs, and timestamps. This data is stored in a plain SQLite file on the device's internal storage. While Android's app sandbox provides some protection, on rooted devices or via backup extraction, this data can reveal detailed information about what models were downloaded, what training tasks were run, what feedback was submitted, and the URLs/endpoints contacted by PCS.",
+    "impact": "On a rooted device or through ADB backup, an attacker can extract the NetworkUsageLog database and obtain a detailed log of all PCS network activity including: which federated learning populations the device participated in, what protected downloads occurred, what URLs were contacted, policy configurations in protobuf form, and timing information. This metadata could be used to fingerprint a user's AI features, identify their participation in specific FL experiments, or reconstruct their PCS usage patterns.",
+    "attack_path": [
+      "1. Attacker gains root access to the device or uses ADB backup",
+      "2. Attacker reads the network_usage_db SQLite file from PCS's internal storage",
+      "3. Attacker extracts NetworkUsageEntity records with connection details, URLs, feature names, sizes, timestamps, FC run IDs, and policy protos"
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/networkusage/db/impl/NetworkUsageLogModule.java:53-59 - DB created without encryption: Room.databaseBuilder(context, NetworkUsageLogDatabase.class, DB_NAME).fallbackToDestructiveMigration().build()",
+      "src/com/google/android/as/oss/networkusage/db/NetworkUsageEntity.java:37-93 - Entity stores URL, status, downloadSize, uploadSize, creationTime, fcRunId, policyProto"
+    ],
+    "remediation": "Consider using SQLCipher or Android's EncryptedSharedPreferences/equivalent for the Room database. The BSA token cache already uses Tink AEAD encryption for its sensitive token data (src/com/google/android/as/oss/privateinference/library/bsa/token/crypto/TinkBsaTokenCipher.kt), demonstrating the pattern is already established in the codebase."
+  },
+  {
+    "id": "VULN-010",
+    "severity": "MEDIUM",
+    "location": "src/com/google/android/as/oss/fl/fcp/service/AstreaExampleStoreService.java:350-351",
+    "title": "FC training feature name from query is logged to statsd without sanitization on internal builds",
+    "description": "In PcsExampleStoreService.logUnknownConnection(), on internal builds (buildFlavor.isInternal()), the unrecognized feature name is logged to statsd by setting it as the connectionKey field in an IntelligenceUnrecognisedNetworkRequestReported atom. The featureName comes from `query.getFeatureName().name()` which is parsed from the training query's protobuf criteria - data controlled by the Federated Compute server. While this is limited to internal builds, the feature name is used without validation as a statsd dimension, potentially allowing metric namespace pollution.",
+    "impact": "On internal/debug builds, a compromised or malicious FC server can send queries with crafted feature names that get logged as statsd atoms, potentially polluting metrics dashboards or exceeding metric cardinality limits.",
+    "attack_path": [
+      "1. Malicious FC server sends a training query with a crafted featureName",
+      "2. PcsExampleStoreService receives the query and finds the feature is not known",
+      "3. On internal builds, logUnknownConnection logs the feature name to statsd as a connection key",
+      "4. The unsanitized string ends up in the metrics system"
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/fl/fcp/service/AstreaExampleStoreService.java:334-351 - logUnknownConnection logs featureName directly to statsd on internal builds",
+      "src/com/google/android/as/oss/fl/fcp/service/AstreaExampleStoreService.java:163 - featureName extracted from query proto"
+    ],
+    "remediation": "Sanitize the feature name before logging (e.g., truncate to reasonable length, restrict to alphanumeric characters). Consider whether logging unrecognized feature names verbatim is necessary even on internal builds."
+  }
+]
