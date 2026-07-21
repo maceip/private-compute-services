@@ -1,0 +1,112 @@
+[
+  {
+    "severity": "HIGH",
+    "location": "src/com/google/android/as/oss/actionlauncher/ActionLauncherActivity.kt:119-132",
+    "title": "ActionLauncherActivity forwards self-asserted client identity and account to AgenticIntegrationService without OS-level verification",
+    "description": "ActionLauncherActivity constructs a ClientInfo protobuf from raw intent extras (CLIENT_APP_NAME_KEY, CLIENT_APP_PACKAGE_NAME_KEY, ACCOUNT_NAME_KEY) and sends it to AGSA's AgenticIntegrationService via gRPC Launch() RPC. Unlike FeatureAvailabilityServiceImpl (which correctly resolves caller identity via PeerUids.REMOTE_PEER.get() and PackageManager at lines 135-158), ActionLauncherActivity blindly trusts the caller-supplied values. A caller with the LAUNCH_ACTION permission can set shouldAutoSubmit=true and shouldAutomate=true to trigger automated AI actions on behalf of a spoofed package or account.",
+    "impact": "Client identity spoofing to the AI assistant backend. If AGSA trusts ClientInfo.appPackageName or ClientInfo.clientAccount for access-control or account-selection decisions, an authorized caller (PSI-signed app) can impersonate any other app or user account when invoking AI actions. Combined with shouldAutomate=true, this could trigger automated actions in the context of the spoofed identity/account.",
+    "attack_path": [
+      "1. Attacker controls an app signed with the PSI prod cert (d439bedff4c060a637ffc07c33ea9fa04a091165c40ee883717c2a89bd5a908f), which satisfies the signature|knownSigner permission.",
+      "2. Attacker sends an Intent to ActionLauncherActivity with extras: CLIENT_APP_PACKAGE_NAME='com.google.android.gms', ACCOUNT_NAME='victim@gmail.com', GEMINI_TEXT_QUERY='<malicious query>', SHOULD_AUTO_SUBMIT=true, SHOULD_AUTOMATE=true.",
+      "3. ActionLauncherActivity.getClientInfo() at line 119 reads these extras without validation and constructs a ClientInfo proto with the attacker-supplied identity.",
+      "4. The ClientInfo is sent to AGSA AgenticIntegrationService.Launch() at line 107, which receives the spoofed identity as if it came from the claimed package/account.",
+      "5. AGSA may perform actions scoped to the spoofed account, since it cannot distinguish this from a legitimate request."
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/actionlauncher/ActionLauncherActivity.kt:119-132 (getClientInfo reads from intent extras without verification)",
+      "src/com/google/android/as/oss/actionlauncher/ActionLauncherActivity.kt:63-65 (reads GEMINI_TEXT_QUERY, SHOULD_AUTO_SUBMIT, SHOULD_AUTOMATE from intent)",
+      "src/com/google/android/as/oss/actionlauncher/ActionLauncherActivity.kt:98-107 (constructs LaunchRequest and sends to stub.launch())",
+      "src/com/google/android/as/oss/actionlauncher/Constants.kt:21-28 (all intent extra keys including ACCOUNT_NAME_KEY)",
+      "src/com/google/android/as/oss/availability/service/impl/FeatureAvailabilityServiceImpl.kt:134-159 (contrast: correct identity resolution via PeerUids.REMOTE_PEER)",
+      "src/com/google/android/as/oss/actionlauncher/AndroidManifest.xml:21-24 (permission definition with knownSigner)",
+      "src/com/google/android/as/oss/actionlauncher/res/values/config.xml:25 (single PSI prod cert)"
+    ],
+    "remediation": "Resolve the caller's actual package name and account via OS-level mechanisms (e.g., Binder.getCallingUid() + PackageManager, or CallerIdentity) instead of reading from untrusted intent extras. Follow the pattern used by FeatureAvailabilityServiceImpl.getClientInfo() which uses PeerUids.REMOTE_PEER. Alternatively, add a cross-check that validates intent-supplied CLIENT_APP_PACKAGE_NAME matches the actual calling package."
+  },
+  {
+    "severity": "HIGH",
+    "location": "src/com/google/android/as/oss/feedback/gateway/service/FeedbackHttpClientService.kt:102",
+    "title": "FeedbackHttpClientService hardcodes allowTestKeys=true on production user builds",
+    "description": "FeedbackHttpClientService is an exported AIDL service (AndroidManifest.xml: exported=true, no permission) that accepts and forwards feedback upload requests. Its onTransact() security check at line 94-106 hardcodes allowTestKeys=true, unlike virtually every other service in PCS which gates test key acceptance on !SecurityPolicyUtils.isUserBuild(). This means apps signed with ASI's known test keys are accepted even on production user builds. This is distinct from the known 'gRPC hardcodes allowTestKeys=true' issue, as this is an AIDL-based service, not the gRPC binder server.",
+    "impact": "On production user-build devices, an app signed with ASI's test certificate can bind to FeedbackHttpClientService and upload arbitrary feedback data (logFeedbackV2Request protobuf) to Google's feedback endpoint via PCS. This bypasses the intended production-only signer restriction. The feedback data is forwarded via FeedbackHttpClient.uploadFeedback() without additional authentication.",
+    "attack_path": [
+      "1. Attacker obtains or derives an app signed with ASI's test signing key (test keys are typically more accessible than production keys).",
+      "2. On a production user-build device, the attacker app binds to FeedbackHttpClientService (exported=true, no android:permission).",
+      "3. FeedbackHttpClientService.binder.onTransact() checks caller authorization at line 94-106 with allowTestKeys=true.",
+      "4. SecurityPolicyUtils.isCallerAuthorized() accepts the test-signed app because allowTestKeys is true.",
+      "5. The attacker calls uploadFeedback() with a crafted logFeedbackV2Request protobuf.",
+      "6. FeedbackHttpClient.uploadFeedback() forwards the data to Google's feedback HTTP endpoint."
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/feedback/gateway/service/FeedbackHttpClientService.kt:94-106 (onTransact with hardcoded allowTestKeys=true)",
+      "src/com/google/android/as/oss/feedback/gateway/service/AndroidManifest.xml:28-32 (exported=true, no permission, tools:ignore=ExportedService)",
+      "src/com/google/android/as/oss/common/security/SecurityPolicyUtils.java:109-113 (test keys added to allowed signatures when allowTestKeys is true)",
+      "src/com/google/android/as/oss/feedback/serviceclient/serviceconnection/ServiceConnectionModule.kt:66-67 (contrast: other Feedback services correctly use !isUserBuild())",
+      "src/com/google/android/as/oss/availability/service/module/FeatureAvailabilityServiceGrpcModule.kt:76 (contrast: correctly uses !isUserBuild())"
+    ],
+    "remediation": "Change line 102 from 'allowTestKeys = true' to 'allowTestKeys = !SecurityPolicyUtils.isUserBuild()' to match the pattern used by all other services in PCS. Additionally, consider adding an android:permission attribute to the service declaration in AndroidManifest.xml."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "src/com/google/android/as/oss/availability/service/impl/FeatureAvailabilityServiceImpl.kt:53,81",
+    "title": "FeatureAvailabilityServiceImpl logs user Google account email to logcat at INFO level",
+    "description": "The isFeatureAvailable() method logs the full FeatureAvailabilityRequest and FeatureAvailabilityResponse objects at INFO level using logger.atInfo().log(). The response object includes accountName, which is the user's Google account email address obtained from AGSA's GetCurrentAccount API. INFO-level logs on Android are written to the system logbuffer and are readable via ADB or by apps with READ_LOGS permission.",
+    "impact": "The user's Google account email (PII) is exposed in logcat whenever any client app queries feature availability. On devices with ADB access (developer mode) or apps with READ_LOGS permission, the account email can be passively observed. This violates the privacy-by-design principle of Private Compute Services, which is specifically designed to protect user data.",
+    "attack_path": [
+      "1. A client app (e.g., PSI) calls the FeatureAvailabilityService.isFeatureAvailable() gRPC method.",
+      "2. FeatureAvailabilityServiceImpl logs the full request at line 53: logger.atInfo().log('...request received: %s', request).",
+      "3. The service fetches the user's current account email from AGSA and includes it in the response.",
+      "4. FeatureAvailabilityServiceImpl logs the full response at line 81: logger.atInfo().log('...sending response: %s', response), which contains the email.",
+      "5. An attacker with ADB access or READ_LOGS runs 'adb logcat' and observes the email in the FeatureAvailabilityService log tag."
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/availability/service/impl/FeatureAvailabilityServiceImpl.kt:53 (logs full request at INFO)",
+      "src/com/google/android/as/oss/availability/service/impl/FeatureAvailabilityServiceImpl.kt:81 (logs full response including accountName at INFO)",
+      "src/com/google/android/as/oss/availability/service/impl/FeatureAvailabilityServiceImpl.kt:70-73 (accountName set from getAgenticIntegrationServiceAccountName)",
+      "src/com/google/android/as/oss/availability/service/impl/FeatureAvailabilityServiceImpl.kt:115-117 (accountName is response.account.email)"
+    ],
+    "remediation": "Remove or redact the accountName field from the logged response. Use atFine() instead of atInfo() for detailed request/response logging. Log only non-PII fields such as feature names and boolean availability results."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "src/com/google/android/as/oss/fl/federatedcompute/logging/statsd/FcClientStatsdLogManager.java:533-546",
+    "title": "Non-TensorFlow FL training error messages forwarded to statsd without content sanitization",
+    "description": "The extractSafeErrorString() method at line 533 only sanitizes error messages for TensorFlow errors (via TfErrorParser.parse()). For all other error types, the raw error message string (truncated to 160 characters) is included directly in the IntelligenceFederatedLearningTrainingLogReported statsd atom and sent to Google's analytics pipeline. Non-TF training errors can contain file paths, internal URLs, exception stack traces, model parameter values, or other sensitive runtime data.",
+    "impact": "Sensitive data embedded in non-TF error messages leaks to Google's centralized analytics (statsd). Java/Android exception messages commonly include file paths (e.g., /data/data/com.google.android.as.oss/...), network endpoint URLs, and internal configuration values. The 160-character limit provides minimal protection since most sensitive paths/URLs fit within that budget.",
+    "attack_path": [
+      "1. During federated learning training, a non-TensorFlow error occurs (e.g., IO error, configuration error, network error).",
+      "2. The error message includes sensitive data such as a file path or internal URL (e.g., 'Failed to read model from /data/user/0/com.google.android.as.oss/files/models/...').",
+      "3. FcClientStatsdLogManager.logTrainerEvent() at line 393 checks event.hasErrorMessage() && flags.allowLoggingErrorMessage().",
+      "4. extractSafeErrorString() at line 533 checks isTensorFlowError() - for non-TF errors, this returns false.",
+      "5. The raw errorMsg is truncated to 160 chars and returned without sanitization.",
+      "6. The error message is set in atomBuilder.setErrorMessage() and logged to statsd via logIntelligenceFlTrainingLogReported()."
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/fl/federatedcompute/logging/statsd/FcClientStatsdLogManager.java:533-546 (extractSafeErrorString only sanitizes TF errors)",
+      "src/com/google/android/as/oss/fl/federatedcompute/logging/statsd/FcClientStatsdLogManager.java:393-396 (error message forwarded to statsd atom)",
+      "src/com/google/android/as/oss/fl/federatedcompute/logging/statsd/FcClientStatsdLogManager.java:548-552 (isTensorFlowError check)",
+      "src/com/google/android/as/oss/fl/federatedcompute/logging/statsd/TfErrorParser.java:55-64 (TF-specific sanitization logic, not applied to other errors)"
+    ],
+    "remediation": "Apply sanitization to all error messages, not just TensorFlow errors. Either extend TfErrorParser with generic patterns (e.g., strip file paths, URLs, and stack traces) or replace the error message with a redacted placeholder for non-TF errors, similar to how TfErrorParser returns '<redacted>' for unrecognized TF error formats."
+  },
+  {
+    "severity": "MEDIUM",
+    "location": "src/com/google/android/as/oss/fl/federatedcompute/logging/statsd/FcClientStatsdLogManager.java:122",
+    "title": "Non-redacting logger writes full FL training events to logcat bypassing Android log redaction",
+    "description": "FcClientStatsdLogManager uses a field named 'nonRedactingLogger' (AndroidFluentLogger) created via Logcat.fc() at line 78. At line 122, this logger writes the entire FcLogEvent protobuf to logcat at DEBUG level: nonRedactingLogger.atDebug().log(event). FcLogEvent contains training configuration names, run IDs, model identifiers, data transfer sizes, and error messages. The explicit use of a non-redacting logger bypasses Android's PersonalizedText / log redaction framework that is designed to strip sensitive data from logs.",
+    "impact": "On userdebug/eng builds, or when DEBUG logging is explicitly enabled (e.g., via 'adb shell setprop log.tag.SP.FC DEBUG'), complete federated learning event data including model identifiers, training configuration names, and data transfer metadata is exposed in logcat without redaction. This enables profiling of which FL populations the device participates in and the associated training parameters.",
+    "attack_path": [
+      "1. On a userdebug or eng device build (common in testing/development environments), or by setting 'adb shell setprop log.tag.SP.FC DEBUG' on any device.",
+      "2. Federated learning training runs and generates FcLogEvent objects.",
+      "3. FcClientStatsdLogManager.logEvent() at line 122 logs the entire event: nonRedactingLogger.atDebug().log(event).",
+      "4. The non-redacting logger writes the full protobuf toString() to logcat, including configName, modelIdentifier, runId, errorMessage, and dataTransferInfo.",
+      "5. An observer with ADB access reads the unredacted training metadata from logcat."
+    ],
+    "evidence": [
+      "src/com/google/android/as/oss/fl/federatedcompute/logging/statsd/FcClientStatsdLogManager.java:78 (nonRedactingLogger = Logcat.fc())",
+      "src/com/google/android/as/oss/fl/federatedcompute/logging/statsd/FcClientStatsdLogManager.java:122 (nonRedactingLogger.atDebug().log(event))",
+      "src/com/google/android/as/oss/fl/federatedcompute/logging/statsd/FcClientStatsdLogManager.java:145 (also logs DebugDiagCode via nonRedactingLogger)"
+    ],
+    "remediation": "Replace the nonRedactingLogger.atDebug().log(event) with the standard GoogleLogger (which respects Android's redaction framework), or log only non-sensitive fields (e.g., event kind, timing metrics) rather than the entire FcLogEvent protobuf. Remove the explicit use of a non-redacting logger for training event data."
+  }
+]
